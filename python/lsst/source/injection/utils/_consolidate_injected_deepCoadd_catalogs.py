@@ -366,7 +366,7 @@ class ConsolidateInjectedCatalogsConfig(  # type: ignore [call-arg]
         # Remove sources outside tract boundaries.
         out_of_tract_bounds = []
         for index, (ra, dec) in enumerate(zip(output_catalog[self.col_ra], output_catalog[self.col_dec])):
-            point = SpherePoint(ra * degrees, dec * degrees)
+            point = SpherePoint(ra, dec, degrees)
             if not tractInfo.contains(point):
                 out_of_tract_bounds.append(index)
         if out_of_tract_bounds:
