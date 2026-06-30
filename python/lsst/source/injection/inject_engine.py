@@ -240,12 +240,17 @@ def make_galsim_object(
     # Create a version of the object with an area-preserving shear applied.
     shear_data = get_shear_data(source_data)
     if shear_data:
-        try:
-            object = object.shear(**shear_data)
-        except TypeError as err:
-            if logger:
-                logger.warning("Cannot apply shear to GalSim object: %s", err)
+        if source_type == "DeltaFunction":
+            #if logger:
+            #    logger.debug("Skipping shear for DeltaFunction source.")
             pass
+        else:
+            try:
+                object = object.shear(**shear_data)
+            except TypeError as err:
+                if logger:
+                    logger.warning("Cannot apply shear to GalSim object: %s", err)
+                pass
     # Apply the instrumental flux and return.
     object = object.withFlux(inst_flux)
     return object
@@ -661,6 +666,24 @@ def inject_galsim_objects_into_exposure(
         fft_size_errors.append(False)
         psf_compute_errors.append(False)
 
+
+        #x = int(np.floor(pixel_coords.x))
+        #y = int(np.floor(pixel_coords.y))
+        #if not bbox.contains(x, y):
+        #    logger.error(
+        #    "POST-CLEAN outside bbox: sky=%s pix=(%.3f,%.3f) pix_i=(%d,%d) bbox=[(%d,%d)–(%d,%d)] obj=%r",
+        #    sky_coords, pixel_coords.x, pixel_coords.y, x, y,
+        #    bbox.minX, bbox.minY, bbox.maxX, bbox.maxY,
+        #    object
+        #)
+        #    continue
+        #if not bbox.contains(pixel_coords):
+        #    logger.error(
+        #    "POST-CLEAN object outside bbox! sky=%s pix=%s bbox=%s object=%r",
+        #    sky_coords, pixel_coords, bbox, object
+        #)
+        #    continue  # or raise RuntimeError to stop immediately
+
         # Get spatial coordinates and WCS.
         posd = galsim.PositionD(pixel_coords.x, pixel_coords.y)
         posi = galsim.PositionI(pixel_coords.x // 1, pixel_coords.y // 1)
@@ -672,9 +695,23 @@ def inject_galsim_objects_into_exposure(
         # This check is here because sometimes the WCS is multivalued and
         # objects that should not be included were being included.
         galsim_pixel_scale = np.sqrt(galsim_wcs.pixelArea())
-        if galsim_pixel_scale < pixel_scale / 2 or galsim_pixel_scale > pixel_scale * 2:
+        #if galsim_pixel_scale < pixel_scale / 2 or galsim_pixel_scale > pixel_scale * 2:
+        #    continue
+        if (not np.isfinite(galsim_pixel_scale)
+            or galsim_pixel_scale < pixel_scale/2
+            or galsim_pixel_scale > pixel_scale*2):
             continue
-
+ 
+        pix_from_sky = wcs.skyToPixel(sky_coords)   # returns Point2D
+        dx = pix_from_sky.x - pixel_coords.x
+        dy = pix_from_sky.y - pixel_coords.y
+        if (not np.isfinite(dx) or not np.isfinite(dy) or abs(dx) > 1.0 or abs(dy) > 1.0):
+            logger.error(
+                "SKY/PIX MISMATCH: sky=%s pixel_coords=%s skyToPixel=%s d=(%.3f,%.3f) obj=%r",
+                sky_coords, pixel_coords, pix_from_sky, dx, dy, object
+            )
+            # for debugging you can continue/skip
+            continue
         # Compute the PSF at the object location.
         try:
             psf_array = psf.computeKernelImage(pixel_coords).array
@@ -705,7 +742,16 @@ def inject_galsim_objects_into_exposure(
         # Convolve the object with the PSF and generate draw size.
         conv = galsim.Convolve(object, galsim_psf)
         if draw_size == 0:
-            draw_size = conv.getGoodImageSize(galsim_wcs.minLinearScale())  # type: ignore
+            scale = galsim_wcs.minLinearScale()
+            if not np.isfinite(scale):
+                logger.error("NaN scale: sky=%s pix=%s mat=%s", sky_coords, pixel_coords, mat)
+                continue
+            try:
+                draw_size = conv.getGoodImageSize(galsim_wcs.minLinearScale())  # type: ignore
+            except Exception as e:
+                logger.error("getGoodImageSize failed: scale=%s sky=%s pix=%s mat=%s obj=%r", scale, sky_coords, pixel_coords, mat, object)
+                raise
+
         injection_draw_size = int(draw_size)
         injection_core_size = 3
         if draw_size_max > 0 and injection_draw_size > draw_size_max:

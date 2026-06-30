@@ -240,6 +240,22 @@ class BaseInjectTask(PipelineTask):
         input_exposure.setPhotoCalib(photo_calib)
         input_exposure.setWcs(wcs)
 
+        self.log.info("original_wcs: %s", original_wcs)
+        self.log.info("new_wcs: %s", wcs)
+        self.log.info("same object? %s", original_wcs is wcs)
+
+
+        corners = [Point2D(x) for x in input_exposure.getBBox().getCorners()]
+        coords = wcs.pixelToSky(corners)
+        ras = [x.getRa().asDegrees() for x in coords]
+        decs = [x.getDec().asDegrees() for x in coords]
+        self.log.info(
+                    "No injection sources overlap the region bounded by "
+                    f"{np.min(ras):.2f} <= RA < {np.max(ras):.2f}, "
+                    f"{np.min(decs):.2f} <= Dec < {np.max(decs):.2f} (degrees). "
+                    "Check injection catalog coverage."
+        )
+
         # Make empty table if none supplied to support process_all_data_ids.
         if len(injection_catalogs) == 0:
             if self.config.process_all_data_ids:
@@ -255,7 +271,6 @@ class BaseInjectTask(PipelineTask):
                     f"{np.min(decs):.2f} <= Dec < {np.max(decs):.2f} (degrees). "
                     "Check injection catalog coverage."
                 )
-
         # Consolidate injection catalogs and compose main injection catalog.
         injection_catalog = self._compose_injection_catalog(injection_catalogs)
 
@@ -275,6 +290,16 @@ class BaseInjectTask(PipelineTask):
             injection_catalog,
             column_mapping,
             input_exposure.getWcs().getPixelScale(input_exposure.getBBox().getCenter()).asArcseconds(),
+        )
+        self.log.info(
+                "before cleaning RA range: %.4f - %.4f",
+                np.min(injection_catalog["ra"]),
+                np.max(injection_catalog["ra"]),
+        )
+        self.log.info(
+                "before cleaning Dec range: %.4f - %.4f",
+                np.min(injection_catalog["dec"]),
+                np.max(injection_catalog["dec"]),
         )
 
         # Clean the injection catalog of sources which are not injectable.
@@ -535,6 +560,7 @@ class BaseInjectTask(PipelineTask):
         # Input catalog must contain either RA/Dec OR x/y.
         # If only x/y given, RA/Dec will be calculated.
         if not has_sky and has_pixel:
+            self.log.info("Thinks the inputs are pixels!")
             begin_x, begin_y = input_exposure.getBBox().getBegin()
             ras, decs = wcs.pixelToSkyArray(
                 begin_x + injection_catalog["x"].astype(float),
@@ -552,6 +578,19 @@ class BaseInjectTask(PipelineTask):
             bbox = input_exposure.getBBox()
             if self.config.trim_padding:
                 bbox.grow(int(self.config.trim_padding))
+                self.log.info("bbox is growing by %d", int(self.config.trim_padding))
+            self.log.info("first ra values looks like %f", injection_catalog["ra"][0])
+            self.log.info("first dec values looks like %f", injection_catalog["dec"][0])
+            self.log.info(
+                "RA range: %.4f - %.4f",
+                np.min(injection_catalog["ra"]),
+                np.max(injection_catalog["ra"]),
+            )
+            self.log.info(
+                "Dec range: %.4f - %.4f",
+                np.min(injection_catalog["dec"]),
+                np.max(injection_catalog["dec"]),
+            )
             is_contained = bbox_contains_sky_coords(
                 bbox, wcs, injection_catalog["ra"] * units.deg, injection_catalog["dec"] * units.deg
             )
