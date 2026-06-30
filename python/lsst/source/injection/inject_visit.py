@@ -39,26 +39,26 @@ class VisitInjectConnections(  # type: ignore [call-arg]
 
     visit_summary = Input(
         doc="A visit summary table containing PSF, PhotoCalib and WCS information.",
-        name="finalVisitSummary",
+        name="visit_summary",
         storageClass="ExposureCatalog",
         dimensions=("visit",),
         deferLoad=True,
     )
     input_exposure = Input(
         doc="Exposure to inject synthetic sources into.",
-        name="calexp",
+        name="preliminary_visit_image",
         storageClass="ExposureF",
         dimensions=("instrument", "visit", "detector"),
     )
     output_exposure = Output(
         doc="Injected Exposure.",
-        name="{injected_prefix}calexp",
+        name="{injected_prefix}preliminary_visit_image",
         storageClass="ExposureF",
         dimensions=("instrument", "visit", "detector"),
     )
     output_catalog = Output(
         doc="Catalog of injected sources.",
-        name="{injected_prefix}calexp_catalog",
+        name="{injected_prefix}preliminary_visit_image_catalog",
         storageClass="ArrowAstropy",
         dimensions=("instrument", "visit", "detector"),
     )
@@ -106,7 +106,6 @@ class VisitInjectTask(BaseInjectTask):
 
     def runQuantum(self, butler_quantum_context, input_refs, output_refs):
         inputs = butler_quantum_context.get(input_refs)
-        detector_id = inputs["input_exposure"].getDetector().getId()
 
         try:
             visit_summary = inputs["visit_summary"].get()
@@ -117,6 +116,7 @@ class VisitInjectTask(BaseInjectTask):
             inputs["wcs"] = inputs["input_exposure"].getWcs()
         else:
             # Use external PSF, PhotoCalib and WCS.
+            detector_id = inputs["input_exposure"].getDetector().getId()
             detector_summary = visit_summary.find(detector_id)
             if detector_summary:
                 inputs["psf"] = detector_summary.getPsf()

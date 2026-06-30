@@ -4,12 +4,12 @@ parameters:
   flux_algorithms: ["cModel", "gaap1p0", "gaap3p0", "kron", "psf", "sersic"]
   source_type_column: "source_type"
 tasks:
-  consolidate_injected_catalogs:
+  consolidateInjectedCatalogs:
     class: lsst.source.injection.utils.ConsolidateInjectedCatalogsTask
-  match_object_to_injected:
+  matchObjectToInjected:
     class: lsst.pipe.tasks.match_tract_catalog.MatchTractCatalogTask
     config:
-      connections.name_input_cat_ref: injected_deepCoadd_catalog_tract
+      connections.name_input_cat_ref: injected_deep_coadd_predetection_catalog_tract
       connections.name_input_cat_target: injected_objectTable_tract
       match_tract_catalog.column_ref_order: i_mag
       match_tract_catalog.columns_ref_meas: ["ra", "dec"]
@@ -43,12 +43,22 @@ tasks:
         ]
         columns_target_copy = [
           "objectId", "patch", "detect_isDeblendedSource", "detect_isPatchInner", "detect_isPrimary",
-          "merge_peak_sky", "refExtendedness", "refSizeExtendedness",
+          "merge_peak_sky", "refExtendedness", "refSizeExtendedness", "shape_xx", "shape_yy", "shape_xy",
+          "shape_flag"
         ]
         bands = parameters.bands_injected
         for band in bands:
           columns_ref_mag_to_nJy[f"{band}_mag"] = f"{band}_flux"
         for band in bands:
+          columns_target_copy.append(f"{band}_hsmShapeRegauss_e1")
+          columns_target_copy.append(f"{band}_hsmShapeRegauss_e2")
+          columns_target_copy.append(f"{band}_hsmShapeRegauss_flag")
+          columns_target_copy.append(f"{band}_hsmShapeRegauss_sigma")
+          columns_target_copy.append(f"{band}_ixxPSF")
+          columns_target_copy.append(f"{band}_iyyPSF")
+          columns_target_copy.append(f"{band}_ixyPSF")
+          columns_target_copy.append(f"{band}_iPSF_flag")
+          columns_target_copy.append(f"{band}_blendedness")
           for suffix in ("mag", "injection_flag"):
               columns_ref_copy.append(f"{band}_{suffix}")
           done_gaap = False

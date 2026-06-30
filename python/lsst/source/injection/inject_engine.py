@@ -396,36 +396,10 @@ def is_wcs_galsim_default(
         return not any(k in hdr for k in ["CD1_1", "CDELT1"])
 
 
-def get_gains_from_amps(
-    exposure: ExposureF,
-) -> tuple[list[Box2I], list[float]] | tuple[None, None]:
-    """Retrieve the bounding boxes and gains for each amplifier, if applicable.
-    If this cannot be done, return None.
-
-    Parameters
-    ----------
-    exposure : `lsst.afw.image.ExposureF`
-        The exposure to inject synthetic sources into.
-
-    Returns
-    -------
-    bboxes : `list` [`lsst.geom.Box2I`]
-        Bounding boxes for each amplifier region in the exposure.
-    gains : `list` [`float`]
-        The gain recorded for each amplifier in this exposure.
-    """
-    try:
-        amplifiers = exposure.getDetector().getAmplifiers()
-        bboxes = [amplifier.getBBox() for amplifier in amplifiers]
-        gains = [amplifier.getGain() for amplifier in amplifiers]
-    except AttributeError:
-        return None, None
-    return bboxes, gains
-
-
 def infer_gain_from_image(
     exposure: ExposureF,
     bad_mask_names: list[str] | None = None,
+    logger: Any | None = None,
 ) -> float:
     """Fit a straight line to image flux vs. estimated variance in each pixel
     of an exposure, and from that infer an estimated average gain.
@@ -437,6 +411,8 @@ def infer_gain_from_image(
     bad_mask_names : `list` [`str`], optional
         Names of any mask plane bits that could indicate a pathological flux
         vs. variance relationship.
+    logger : `lsst.utils.logging.LsstLogAdapter`, optional
+        Logger to use for logging messages.
 
     Returns
     -------
@@ -445,73 +421,123 @@ def infer_gain_from_image(
     """
     image_arr = exposure.image.array
     var_arr = exposure.variance.array
-    mask_arr = exposure.mask.array
     good = np.isfinite(image_arr) & np.isfinite(var_arr)
-    if bad_mask_names is not None:
-        bad_mask_bit_mask = exposure.mask.getPlaneBitMask(bad_mask_names)
-        good &= (mask_arr.astype(int) & bad_mask_bit_mask) == 0
+
+    mask = exposure.mask
+    # Only look at mask names in the mask_plane_dict.
+    # Otherwise, getPlaneBitMask throws an exception.
+    mask_plane_dict = mask.getMaskPlaneDict()
+    if bad_mask_names is None:
+        bad_mask_names = []
+    missing = set(bad_mask_names) - set(mask_plane_dict)
+    if missing and logger:
+        logger.warning("Mask planes not found in exposure (skipping): %s", missing)
+    bad_mask_names = [name for name in bad_mask_names if name in mask_plane_dict]
+    if len(bad_mask_names) > 0:
+        bad_mask_bit_mask = mask.getPlaneBitMask(bad_mask_names)
+        good &= (mask.array.astype(int) & bad_mask_bit_mask) == 0
+
+    # Check for sufficient points to fit.
+    n_good = int(np.count_nonzero(good))
+    if n_good < 2:
+        if logger:
+            logger.warning("Too few valid pixels (%d) to infer gain from image; returning NaN.", n_good)
+        return float("nan")
+
     fit = np.polyfit(image_arr[good], var_arr[good], deg=1)
-    return 1.0 / fit[0]
+    slope = fit[0]
+    # The gain is 1 / slope, so a non-positive or non-finite slope gives a
+    # non-physical gain. Flag it as NaN rather than propagate a negative,
+    # zero, or infinite gain into the noise model.
+    if not np.isfinite(slope) or slope <= 0:
+        if logger:
+            logger.warning("Inferred a non-physical variance-vs-flux slope (%g); returning NaN gain.", slope)
+        return float("nan")
+    return 1.0 / slope
 
 
 def get_gain_map(
     exposure: ExposureF,
-    full_bounds: galsim.BoundsI,
     bad_mask_names: list[str] | None = None,
-) -> tuple[galsim.Image, bool]:
+    logger: Any | None = None,
+) -> galsim.Image:
     """Retrieve gains for each pixel.
 
     Parameters
     ----------
     exposure : `lsst.afw.image.ExposureF`
         The exposure to inject synthetic sources into.
-    full_bounds : `galsim.BoundsI`
-        Bounding box covering the entire exposure.
     bad_mask_names : `list` [`str`], optional
         Names of any mask plane bits that could indicate a pathological flux
         vs. variance relationship.
+    logger : `lsst.utils.logging.LsstLogAdapter`, optional
+        Logger to use for logging messages.
 
     Returns
     -------
     gain_map : `galsim.Image`
         The gain to use in each pixel.
-    is_single_CCD : `bool`
-        Whether the exposure represents a single CCD, having well-defined
-        amplifier regions with recorded gains.
     """
-    gain_map = galsim.Image(full_bounds, dtype=float)
-    is_single_CCD = True
+    full_bbox = exposure.getBBox()
+    try:
+        amplifiers = exposure.getDetector().getAmplifiers()
+        bboxes = [amplifier.getBBox() for amplifier in amplifiers] if amplifiers else None
+    except AttributeError:
+        bboxes = None
+    if not bboxes:
+        bboxes = [full_bbox]
 
-    bboxes, gains = get_gains_from_amps(exposure)
-    if bboxes is None:
-        # Separate amplifier bounding boxes not found.
-        # This exposure does not represent a single CCD.
-        is_single_CCD = False
-        bboxes = [full_bounds]
-        gains = [infer_gain_from_image(exposure, bad_mask_names)]
+    gains = np.array(
+        [infer_gain_from_image(exposure.subset(bbox), bad_mask_names, logger) for bbox in bboxes],
+        dtype=float,
+    )
 
-    assert gains is not None  # Make mypy happy.
-    for bbox, gain in zip(bboxes, gains):
-        if is_single_CCD:
-            bounds = galsim.BoundsI(bbox.minX, bbox.maxX, bbox.minY, bbox.maxY)
+    # Catch unphysical values and replace with fallback values
+    usable = np.isfinite(gains) & (gains > 0)
+    if not np.all(usable):
+        if np.any(usable):
+            # Use the median of the regions that did fit (e.g. the other
+            # amplifiers of the same detector).
+            fallback = float(np.median(gains[usable]))
         else:
-            bounds = galsim.BoundsI(bbox.getXMin(), bbox.getXMax(), bbox.getYMin(), bbox.getYMax())
+            # Nothing fit. Try a single fit over the whole exposure (which can
+            # succeed even when individual sub-regions do not), then fall back
+            # to unit gain as a last resort.
+            fallback = 1.0
+            if len(bboxes) > 1:
+                whole = infer_gain_from_image(exposure, bad_mask_names, logger)
+                if np.isfinite(whole) and whole > 0:
+                    fallback = whole
+        if logger:
+            logger.warning(
+                "Could not infer gain for %d of %d region(s); using fallback gain %g.",
+                int(np.count_nonzero(~usable)),
+                len(gains),
+                fallback,
+            )
+        gains[~usable] = fallback
+
+    full_bounds = galsim.BoundsI(full_bbox.minX, full_bbox.maxX, full_bbox.minY, full_bbox.maxY)
+    gain_map = galsim.Image(full_bounds, dtype=float)
+    for bbox, gain in zip(bboxes, gains):
+        bounds = galsim.BoundsI(bbox.minX, bbox.maxX, bbox.minY, bbox.maxY)
         gain_map[bounds].array[:] = 1.0 / gain
-    return gain_map, is_single_CCD
+
+    return gain_map
 
 
 def add_noise_to_galsim_image(
     image_template: galsim.Image,
     var_template: galsim.Image,
-    is_single_CCD: bool,
+    is_coadd: bool,
     gain_map: galsim.Image,
     object_common_bounds: galsim.BoundsI,
     noise_seed: int | None = None,
     logger: Any | None = None,
 ) -> tuple[galsim.Image, galsim.Image]:
     """Add noise to a supplied image, and adjust the estimated variance
-    accordingly. If the image represents a single CCD exposure, add Poisson
-    shot noise. Otherwise add Gaussian noise.
+    accordingly. If the image represents a coadd, add Gaussian noise.
+    Otherwise add Poisson shot noise.
 
     Parameters
     ----------
@@ -519,9 +545,9 @@ def add_noise_to_galsim_image(
         The image to add noise to.
     var_template : `galsim.Image`
         The variance to use for the noise generating process in each pixel.
-    is_single_CCD : `bool`
-        Whether the exposure represents a single CCD, having well-defined
-        amplifier regions with recorded gains.
+    is_coadd : `bool`
+        Whether the exposure is a coadd. If True, Gaussian noise is used;
+        if False, Poisson shot noise is used.
     gain_map : `galsim.Image`
         The gain to use in each pixel of the full exposure.
     object_common_bounds : `galsim.BoundsI`
@@ -552,7 +578,7 @@ def add_noise_to_galsim_image(
 
     rng = galsim.BaseDeviate(noise_seed)
 
-    if is_single_CCD:
+    if not is_coadd:
         # Treat noise_template, which is the expected amount of
         # injected flux divided by the gain, as the Poisson mean of
         # the number of photons collected by each pixel.
@@ -653,7 +679,8 @@ def inject_galsim_objects_into_exposure(
     galsim_variance = galsim.Image(exposure.variance.array, bounds=full_bounds)
     pixel_scale = wcs.getPixelScale(bbox.getCenter()).asArcseconds()
 
-    gain_map, is_single_CCD = get_gain_map(exposure, full_bounds, bad_mask_names)
+    gain_map = get_gain_map(exposure, bad_mask_names, logger)
+    is_coadd = exposure.info.getCoaddInputs() is not None
 
     draw_sizes: list[int] = []
     common_bounds: list[galsim.BoundsI] = []
@@ -783,8 +810,9 @@ def inject_galsim_objects_into_exposure(
             common_variance = galsim_variance[object_common_bounds]
 
             offset = posd - object_common_bounds.true_center
-            # Note, for calexp injection, pixel is already part of the PSF and
-            # for coadd injection, it's incorrect to include the output pixel.
+            # Note, for preliminary_visit_image injection, pixel is already
+            # part of the PSF and for coadd injection, it's incorrect to
+            # include the output pixel.
             # So for both cases, we draw using method='no_pixel'.
             image_template = common_image.copy()
             try:
@@ -810,7 +838,7 @@ def inject_galsim_objects_into_exposure(
                 image_template, var_template = add_noise_to_galsim_image(
                     image_template,
                     var_template,
-                    is_single_CCD,
+                    is_coadd,
                     gain_map,
                     object_common_bounds,
                     noise_seed,

@@ -412,6 +412,7 @@ class BaseInjectTask(PipelineTask):
         metadata = input_exposure.getMetadata()
         input_dataset_type = self.config.connections.input_exposure.format(**self.config.connections.toDict())
         metadata.set("INJECTED", input_dataset_type, "Initial source injection dataset type")
+        input_exposure.getInfo().setVisitInfo(input_exposure.visitInfo.copyWith(hasSimulatedContent=True))
         for flag, value in sorted(binary_flags.items(), key=lambda item: item[1]):
             injection_catalog.meta[flag] = value
 
@@ -440,7 +441,7 @@ class BaseInjectTask(PipelineTask):
         self.config = cast(BaseInjectConfig, self.config)
 
         # Generate injection IDs (if not provided) and injection flag column.
-        injection_data = vstack(injection_catalogs)
+        injection_data = vstack(injection_catalogs, metadata_conflicts="silent")
         if "injection_id" in injection_data.columns:
             injection_id = injection_data["injection_id"]
             injection_data.remove_column("injection_id")
